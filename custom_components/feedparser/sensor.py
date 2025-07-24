@@ -119,6 +119,8 @@ class FeedParserSensor(SensorEntity):
         self._entries: list[dict[str, str]] = []
         self._attr_extra_state_attributes = {"entries": self._entries}
         self._attr_attribution = "Data retrieved using RSS feedparser"
+        self._fail_count = 0
+        self._last_fail_retry: datetime | None = None
         _LOGGER.debug("Feed %s: FeedParserSensor initialized - %s", self.name, self)
 
     def __repr__(self: FeedParserSensor) -> str:
@@ -134,12 +136,43 @@ class FeedParserSensor(SensorEntity):
 
     def update(self: FeedParserSensor) -> None:
         """Parse the feed and update the state of the sensor."""
+        now = datetime.now(timezone.utc)
+        
+        
+        # Retry-logik
+        if self._fail_count > 0:
+            if self._fail_count >= 3:
+                _LOGGER.warning("Feed %s: Skipping update — reached max retry attempts (3)", self.name)
+                return
+            if self._last_fail_retry and (now - self._last_fail_retry) < timedelta(minutes=5):
+                _LOGGER.info("Feed %s: Waiting 5 min between retries (%s/3)", self.name, self._fail_count)
+                return
+            
+        
         _LOGGER.debug("Feed %s: Polling feed data from %s", self.name, self._feed)
         s: requests.Session = requests.Session()
         s.mount("file://", FileAdapter())
         s.headers.update({"User-Agent": USER_AGENT})
-        res: requests.Response = s.get(self._feed)
-        res.raise_for_status()
+        try:
+            res: requests.Response = s.get(self._feed, timeout=5)
+            res.raise_for_status()
+        except requests.exceptions.Timeout:
+            _LOGGER.warning("Feed %s: Timed out after 5 seconds while fetching %s", self.name, self._feed)
+            self._fail_count += 1
+            self._last_fail_retry = now
+            self._attr_native_value = None
+            return
+        except requests.exceptions.RequestException as e:
+            _LOGGER.warning("Feed %s: Failed to fetch feed: %s", self.name, e)
+            self._fail_count += 1
+            self._last_fail_retry = now
+            self._attr_native_value = None
+            return
+
+        # Lyckad hämtning → återställ felräknare
+        self._fail_count = 0
+        self._last_fail_retry = None
+
         parsed_feed: FeedParserDict = feedparser.parse(res.text)
 
         if not parsed_feed.entries:
